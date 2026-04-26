@@ -1,15 +1,19 @@
-# DnCNN / U-Net Image Denoising with Jittor
+# 人工智能高阶课大作业：myDnCNN
 
-> 课程作业项目：将经典 DnCNN 图像去噪实验迁移到 Jittor，并在盲去噪设置下引入噪声水平图与轻量 U-Net 结构进行实验。
+> 论文复现和改进项目：主题为 **图像去噪**。将经典 DnCNN 图像去噪实验迁移到 Jittor，并在盲去噪设置下引入噪声水平图与轻量 U-Net 结构进行实验。
 
-## Highlights
+![Jittor](https://img.shields.io/badge/Jittor-1.3%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.9%2B-green)
+![Task](https://img.shields.io/badge/Task-Image%20Denoising-orange)
+
+## 主要特性
 
 - **任务**：灰度图像加性高斯噪声去除，覆盖固定噪声与盲去噪两种模式。
 - **框架**：Jittor，保留 PyTorch 版 DnCNN 的残差学习思想。
 - **模型**：输入为 `noisy image + noise level map`，网络预测噪声残差，输出通过 `clean = noisy - predicted_noise` 得到。
 - **评估**：在 Set12、Set68 上统计 PSNR / SSIM。
 
-## Repository Layout
+## 仓库结构
 
 ```text
 .
@@ -23,7 +27,7 @@
 └── README.md
 ```
 
-## Environment
+## 环境配置
 
 建议使用 Python 3.9+。如果本机有 CUDA，Jittor 会自动编译并调用 GPU 后端。
 
@@ -37,7 +41,7 @@ python -m pip install -r requirements.txt
 python -m pip install jittor
 ```
 
-## Quick Start
+## 快速开始
 
 首次训练前需要把 `data/train` 和 `data/Set12` 预处理成 `train.h5`、`val.h5`：
 
@@ -70,8 +74,8 @@ nohup python train.py --preprocess True --mode B --val_noiseL 25 --outf logs/DnC
 
 采用以下两个量化指标：
 
-- **PSNR (Peak Signal-to-Noise Ratio)**：单位dB，数值越大越好
-- **SSIM (Structural Similarity Index)**：范围[0,1]，数值越大表示感知质量越好
+- **PSNR**：单位dB，数值越大越好
+- **SSIM**：范围[0,1]，数值越大表示感知质量越好
 
 ### 噪声水平
 
@@ -143,14 +147,14 @@ python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 25
 
 3. **架构优势**：相比原始残差网络设计，带有跳接的轻量级U-Net能更好地捕捉多尺度噪声特征，特别是在高噪声盲去噪场景中表现突出。
 
-## Notes
+## 说明
 
 - `--mode S` 表示固定噪声水平训练，`--mode B` 表示盲去噪训练。
 - `--num_of_layers` 仅为兼容早期 DnCNN 命令保留；当前模型结构定义在 `models.py` 的 `UNet` 中。
 - 测试脚本会自动把输入图像 padding 到 8 的倍数，以匹配 3 层下采样结构，再裁剪回原尺寸计算指标。
 - 曾尝试加入注意力模块与对抗训练。注意力模块在当前 AWGN 设置下收益有限；对抗训练增加了训练成本且未带来稳定提升，因此最终版本保留更稳定的噪声水平图 + U-Net 方案。
 
-## Reference
+## 参考文献
 
 - Zhang et al., [Beyond a Gaussian Denoiser: Residual Learning of Deep CNN for Image Denoising](https://ieeexplore.ieee.org/document/7839189/)
 - Original MATLAB implementation: [cszn/DnCNN](https://github.com/cszn/DnCNN)
