@@ -1,138 +1,161 @@
+"""Dataset preparation and HDF5-backed data loading."""
+
+import glob
 import os
-import os.path
-import numpy as np
 import random
+
+import cv2
 import h5py
 import jittor as jt
-import cv2
-import glob
+import numpy as np
 from jittor.dataset import Dataset as JtDataset
-from skimage import io
-from skimage.transform import resize
+
+from utils import data_augmentation, normalize_uint8
 
 
-from utils import data_augmentation
+DEFAULT_SCALES = (1.0, 0.9, 0.8, 0.7)
 
-def normalize(data):
-    return data/255.
 
-# 分割函数：将原图片分割成数个小图像块 (已优化)
-def Im2Patch(img, win, stride=1):
-    """
-    使用 numpy.lib.stride_tricks 高效地从图像中提取 patch
-    """
+def crop_to_multiple(image, factor=16):
+    """Crop image height and width so they are divisible by ``factor``."""
+
+    if image.ndim == 3 and image.shape[0] == 1:
+        height, width = image.shape[1], image.shape[2]
+        chw = True
+    else:
+        height, width = image.shape[0], image.shape[1]
+        chw = False
+
+    new_height = (height // factor) * factor
+    new_width = (width // factor) * factor
+    if new_height == 0 or new_width == 0:
+        raise ValueError(
+            f"Image size {height}x{width} is too small after cropping to {factor}."
+        )
+
+    if chw:
+        return image[:, :new_height, :new_width]
+    return image[:new_height, :new_width, ...]
+
+
+def image_to_patches(image, patch_size, stride=1):
+    """Extract sliding-window patches from a CHW image."""
+
     from numpy.lib.stride_tricks import as_strided
-    C, H, W = img.shape
 
-    # 计算输出形状
-    out_H = (H - win) // stride + 1
-    out_W = (W - win) // stride + 1
+    channels, height, width = image.shape
+    out_height = (height - patch_size) // stride + 1
+    out_width = (width - patch_size) // stride + 1
+    channel_stride, height_stride, width_stride = image.strides
+    patches = as_strided(
+        image,
+        shape=(channels, out_height, out_width, patch_size, patch_size),
+        strides=(
+            channel_stride,
+            height_stride * stride,
+            width_stride * stride,
+            height_stride,
+            width_stride,
+        ),
+    )
+    return patches.transpose(0, 3, 4, 1, 2).reshape(channels, patch_size, patch_size, -1)
 
-    s_C, s_H, s_W = img.strides
-    # 为新的 patch 数组视图定义 strides
-    new_strides = (s_C, s_H * stride, s_W * stride, s_H, s_W)
-    patches = as_strided(img, shape=(C, out_H, out_W, win, win), strides=new_strides)
-    # 重塑为期望的输出格式: (C, win, win, num_patches)
-    return patches.transpose(0, 3, 4, 1, 2).reshape(C, win, win, -1)
 
-#数据处理函数：训练数据——多尺度、多增强的小块  测试数据——完整图像
-def prepare_data(data_path, patch_size, stride, aug_times=1):
-    # train
+# Backward-compatible name used by the original script.
+Im2Patch = image_to_patches
 
-    # Helper function to ensure image dimensions are divisible by a factor
-    def ensure_divisibility(img_array, factor=16):
-        # img_array can be (H, W, C) or (H, W) or (1, H, W)
-        if img_array.ndim == 3 and img_array.shape[0] == 1: # (1, H, W)
-            H, W = img_array.shape[1], img_array.shape[2]
-            is_chw_format = True
-        else: # (H, W, C) or (H, W)
-            H, W = img_array.shape[0], img_array.shape[1]
-            is_chw_format = False
 
-        new_H = (H // factor) * factor
-        new_W = (W // factor) * factor
+def load_grayscale_chw(path):
+    """Read an image as normalized grayscale CHW data."""
 
-        if new_H == 0 or new_W == 0: # Check for zero dimension after cropping
-            raise ValueError(f"Image dimension ({H}x{W}) is too small to be divisible by {factor} and result in non-zero size.")
+    image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read image: {path}")
+    image = np.expand_dims(image, axis=0)
+    return np.float32(normalize_uint8(image))
 
-        if new_H != H or new_W != W:
-            if is_chw_format: # (1, H, W)
-                img_array = img_array[:, :new_H, :new_W]
-            else: # (H, W, C) or (H, W)
-                img_array = img_array[:new_H, :new_W, ...] # Use ... to handle C dimension if present
-        return img_array
 
-    print('process training data')
-    scales = [1, 0.9, 0.8, 0.7]
-    files = glob.glob(os.path.join(data_path, 'train', '*.png'))
-    files.sort()
-    h5f = h5py.File('train.h5', 'w')
+def prepare_data(
+    data_path,
+    patch_size,
+    stride,
+    aug_times=1,
+    train_output="train.h5",
+    val_output="val.h5",
+):
+    """Build train/validation HDF5 files from ``data/train`` and ``data/Set12``."""
+
+    train_files = sorted(glob.glob(os.path.join(data_path, "train", "*.png")))
+    if not train_files:
+        raise FileNotFoundError(f"No training images found under {data_path}/train")
+
+    print("Processing training data")
     train_num = 0
-    for i in range(len(files)):
-        img = cv2.imread(files[i])
-        # Original image (H, W, C)
-        # No need to ensure divisibility here, as it will be resized and then processed
-        for k in range(len(scales)):
-            # Resize first, then ensure divisibility
-            resized_img = cv2.resize(img, (int(img.shape[1]*scales[k]), int(img.shape[0]*scales[k])), interpolation=cv2.INTER_CUBIC)
-            processed_img = ensure_divisibility(resized_img, factor=16) # Ensure (H, W, C) is divisible
-            processed_img = np.float32(normalize(np.expand_dims(processed_img[:,:,0], 0))) # Convert to (1, H, W) and normalize
-            patches = Im2Patch(processed_img, win=patch_size, stride=stride)
-            print("file: %s scale %.1f # samples: %d" % (files[i], scales[k], patches.shape[3]*aug_times))
-            for n in range(patches.shape[3]):
-                data = patches[:,:,:,n].copy()
-                h5f.create_dataset(str(train_num), data=data)
-                train_num += 1
-                for m in range(aug_times-1):
-                    data_aug = data_augmentation(data, np.random.randint(1,8))
-                    h5f.create_dataset(str(train_num)+"_aug_%d" % (m+1), data=data_aug)
-                    train_num += 1
-    h5f.close()
-    # val
-    print('\nprocess validation data')
-    files.clear()
-    files = glob.glob(os.path.join(data_path, 'Set12', '*.png'))
-    files.sort()
-    h5f = h5py.File('val.h5', 'w')
-    val_num = 0
-    for i in range(len(files)):
-        print("file: %s" % files[i])
+    with h5py.File(train_output, "w") as h5f:
+        for file_path in train_files:
+            image = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise FileNotFoundError(f"Failed to read image: {file_path}")
 
-        img = cv2.imread(files[i]) # (H, W, C)
-        processed_img = ensure_divisibility(img, factor=16) # Ensure (H, W, C) is divisible
-        processed_img = np.float32(normalize(np.expand_dims(processed_img[:,:,0], 0))) # Convert to (1, H, W) and normalize
-        h5f.create_dataset(str(val_num), data=processed_img)
-        val_num += 1
-    h5f.close()
-    print('training set, # samples %d\n' % train_num)
-    print('val set, # samples %d\n' % val_num)
+            for scale in DEFAULT_SCALES:
+                resized = cv2.resize(
+                    image,
+                    (int(image.shape[1] * scale), int(image.shape[0] * scale)),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+                resized = crop_to_multiple(resized, factor=16)
+                chw_image = np.float32(normalize_uint8(np.expand_dims(resized, axis=0)))
+                patches = image_to_patches(chw_image, patch_size=patch_size, stride=stride)
+                print(
+                    "file: %s scale %.1f # samples: %d"
+                    % (file_path, scale, patches.shape[3] * aug_times)
+                )
+
+                for patch_idx in range(patches.shape[3]):
+                    patch = patches[:, :, :, patch_idx].copy()
+                    h5f.create_dataset(str(train_num), data=patch)
+                    train_num += 1
+
+                    for aug_idx in range(aug_times - 1):
+                        augmented = data_augmentation(patch, random.randint(1, 7))
+                        h5f.create_dataset(f"{train_num}_aug_{aug_idx + 1}", data=augmented)
+                        train_num += 1
+
+    print("\nProcessing validation data")
+    val_files = sorted(glob.glob(os.path.join(data_path, "Set12", "*.png")))
+    if not val_files:
+        raise FileNotFoundError(f"No validation images found under {data_path}/Set12")
+
+    val_num = 0
+    with h5py.File(val_output, "w") as h5f:
+        for file_path in val_files:
+            print(f"file: {file_path}")
+            image = crop_to_multiple(load_grayscale_chw(file_path), factor=16)
+            h5f.create_dataset(str(val_num), data=image)
+            val_num += 1
+
+    print(f"training set, # samples {train_num}\n")
+    print(f"validation set, # samples {val_num}\n")
+
 
 class Dataset(JtDataset):
-    def __init__(self, train=True):
-        super(Dataset, self).__init__()
+    """Lazy HDF5 dataset for Jittor DataLoader workers."""
+
+    def __init__(self, train=True, train_path="train.h5", val_path="val.h5"):
+        super().__init__()
         self.train = train
-        self.h5f = None  # 文件句柄将在 __getitem__ 中为每个 worker 初始化，以保证多进程安全
-        if self.train:
-            self.h5_path = 'train.h5'
-        else:
-            self.h5_path = 'val.h5'
-        
-        # 在初始化时一次性读取所有 keys
-        with h5py.File(self.h5_path, 'r') as h5f:
+        self.h5_path = train_path if train else val_path
+        self.h5f = None
+
+        with h5py.File(self.h5_path, "r") as h5f:
             self.keys = list(h5f.keys())
+        if self.train:
             random.shuffle(self.keys)
 
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, index):
-        # 在多进程数据加载 (num_workers > 0) 场景下，__init__ 在主进程中调用，
-        # 而 __getitem__ 在 worker 进程中调用。h5py 文件对象不可序列化 (pickle)，
-        # 因此不能在 __init__ 中打开并在 __getitem__ 中使用。
-        # 常见的模式是在 worker 进程中首次调用时打开文件，并缓存文件句柄。
         if self.h5f is None:
-            self.h5f = h5py.File(self.h5_path, 'r')
-
-        key = self.keys[index]
-        data = np.array(self.h5f[key])
-        return jt.array(data)
+            self.h5f = h5py.File(self.h5_path, "r")
+        return jt.array(np.array(self.h5f[self.keys[index]]))

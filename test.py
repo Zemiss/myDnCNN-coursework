@@ -1,127 +1,103 @@
-import cv2
-import os
+"""Evaluate a trained denoising model on Set12 or Set68."""
+
 import argparse
 import glob
-import numpy as np
+import os
+
+import cv2
 import jittor as jt
-from jittor import nn
-from models import UNet 
-from utils import * # 假设 utils 中包含了 batch_PSNR, batch_SSIM 等函数
-jt.flags.use_cuda = 1
+import numpy as np
 
-# --- 1. 参数设置 ---
-parser = argparse.ArgumentParser(description="DnCNN_Test")
+from models import UNet
+from utils import batch_PSNR, batch_SSIM, normalize_uint8
 
-parser.add_argument("--num_of_layers", type=int, default=17, help="Number of total layers (Placeholder)")
-parser.add_argument("--logdir", type=str, default="logs", help='Directory of the log/model files (where trained weights are saved)')
-parser.add_argument("--test_data", type=str, default='Set12', help='test on Set12 or BSD68')
-parser.add_argument("--test_noiseL", type=float, default=25, help='noise level used on test set')
 
-opt = parser.parse_args()
+PAD_FACTOR = 8
 
-# --- 2. 辅助函数 ---
-def normalize(data):
-    """将图像像素值归一化到 [0, 1]"""
-    return data / 255.
 
-# --- 3. 主函数 ---
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate DnCNN-style denoiser")
+    parser.add_argument("--num_of_layers", type=int, default=17, help="Kept for old commands.")
+    parser.add_argument("--logdir", type=str, default="logs/DnCNN-B")
+    parser.add_argument("--test_data", type=str, default="Set12", choices=("Set12", "Set68"))
+    parser.add_argument("--test_noiseL", type=float, default=25)
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--use-cuda", type=lambda value: value.lower() in ("1", "true", "yes"), default=True)
+    return parser.parse_args()
+
+
+def pad_to_multiple(tensor, factor=PAD_FACTOR):
+    """Pad BCHW tensor on the bottom/right edges to match the U-Net stride."""
+
+    _, _, height, width = tensor.shape
+    padded_height = (height + factor - 1) // factor * factor
+    padded_width = (width + factor - 1) // factor * factor
+    pad_h = padded_height - height
+    pad_w = padded_width - width
+    if pad_h == 0 and pad_w == 0:
+        return tensor, height, width
+
+    padded = np.pad(tensor.numpy(), ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), mode="edge")
+    return jt.array(padded), height, width
+
+
+def load_image(path):
+    image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read image: {path}")
+    image = normalize_uint8(np.float32(image))
+    image = np.expand_dims(np.expand_dims(image, axis=0), axis=0)
+    return jt.array(image)
+
+
+def evaluate_image(model, clean, noise_level):
+    padded_clean, original_height, original_width = pad_to_multiple(clean)
+    sigma = noise_level / 255.0
+    noise = jt.randn(padded_clean.shape) * sigma
+    noisy = padded_clean + noise
+    noise_map = jt.full_like(padded_clean, sigma)
+    model_input = jt.concat([noisy, noise_map], dim=1)
+
+    with jt.no_grad():
+        predicted_noise = model(model_input)
+        restored = jt.clamp(noisy - predicted_noise, 0.0, 1.0)
+
+    restored = restored[..., :original_height, :original_width]
+    return batch_PSNR(restored, clean, 1.0), batch_SSIM(restored, clean, 1.0)
+
+
 def main():
+    args = parse_args()
+    jt.flags.use_cuda = 1 if args.use_cuda else 0
     print(f"Using Jittor with CUDA: {jt.flags.use_cuda}")
-    
-    DOWNSAMPLE_FACTOR = 8 
-    
-    # Build model
-    print('Loading model ...\n')
-    net = UNet(channels=1)
-    model = net
-    
-    model_path = os.path.join(opt.logdir, 'net.pkl')
+
+    model_path = os.path.join(args.logdir, "net.pkl")
     if not os.path.exists(model_path):
-        print(f"Error: Model file not found at {model_path}")
-        return
-        
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    print("Loading model ...")
+    model = UNet(channels=1)
     model.load_state_dict(jt.load(model_path))
-    model.eval() 
-    
-    # load data info
-    print('Loading data info ...\n')
-    files_source = glob.glob(os.path.join('data', opt.test_data, '*.png'))
-    files_source.sort()
-    
-    if not files_source:
-        print(f"Error: No images found in data/{opt.test_data}")
-        return
+    model.eval()
 
-    # process data
-    psnr_test = 0
-    ssim_test = 0
-    
-    for f in files_source:
-        # --- 图像读取和预处理 ---
-        Img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-        H_orig, W_orig = Img.shape 
-        Img = normalize(np.float32(Img))
-        
-        # --- 填充图像至 DOWNSAMPLE_FACTOR 的倍数 ---
-        
-        H_pad_total = (H_orig + DOWNSAMPLE_FACTOR - 1) // DOWNSAMPLE_FACTOR * DOWNSAMPLE_FACTOR
-        W_pad_total = (W_orig + DOWNSAMPLE_FACTOR - 1) // DOWNSAMPLE_FACTOR * DOWNSAMPLE_FACTOR
-        
-        pad_h = H_pad_total - H_orig
-        pad_w = W_pad_total - W_orig
-        
-        # 将 Numpy 数组转换为 Jittor Tensor (B=1, C=1, H, W)
-        Img = np.expand_dims(Img, 0) 
-        Img = np.expand_dims(Img, 1) 
-        # 注意：此处 ISource 仍然是 Jittor Tensor，但我们将在下一步使用 np.pad
-        ISource_orig = jt.array(Img) 
-        
-        # *** 最终修正：使用 np.pad 进行填充 ***
-        
-        # 1. 提取 numpy 数组 (Jittor to Numpy)
-        Img_np = ISource_orig.numpy()
-        
-        # 2. 定义填充参数 (只填充右侧和底部)
-        # 格式: ((B_b, B_a), (C_b, C_a), (H_b, H_a), (W_b, W_a))
-        # pad_h 和 pad_w 对应 H 和 W 维度的 "after" (尾部) 填充
-        pad_params = ((0, 0), (0, 0), (0, pad_h), (0, pad_w))
-        
-        # 3. 使用 numpy 的 'edge' 模式进行复制边界填充
-        Img_padded_np = np.pad(Img_np, pad_params, mode='edge')
-        
-        # 4. 转换回 Jittor Tensor
-        ISource_padded = jt.array(Img_padded_np)
-        
-        # --- 噪声和模型输入准备 ---
-        
-        noise = jt.randn(ISource_padded.shape) * (opt.test_noiseL/255.)
-        INoisy = ISource_padded + noise
-        
-        noise_map = jt.full_like(ISource_padded, opt.test_noiseL/255.)
-        model_input = jt.concat([INoisy, noise_map], dim=1)
+    pattern = os.path.join(args.data_dir, args.test_data, "*.png")
+    image_files = sorted(glob.glob(pattern))
+    if not image_files:
+        raise FileNotFoundError(f"No images found: {pattern}")
 
-        # --- 推理 ---
-        with jt.no_grad():
-            predicted_noise = model(model_input)
-            Out_padded = jt.clamp(INoisy - predicted_noise, 0., 1.)
-        
-        # --- 裁剪回原始尺寸 ---
-        Out = Out_padded[..., :H_orig, :W_orig] 
-        
-        # --- 评估 ---
-        current_psnr = batch_PSNR(Out, ISource_orig, 1.) # 评估使用未填充的原始图像
-        current_ssim = batch_SSIM(Out, ISource_orig, 1.)
-        
-        psnr_test += current_psnr
-        ssim_test += current_ssim
-        print(f"{os.path.basename(f)} PSNR {current_psnr:.4f} SSIM {current_ssim:.4f}")
-        
-    # 计算平均值并打印
-    num_files = len(files_source)
-    ssim_test /= num_files
-    psnr_test /= num_files
-    print(f"\nAverage PSNR on {opt.test_data} (Noise={opt.test_noiseL}): {psnr_test:.4f}")
-    print(f"Average SSIM on {opt.test_data} (Noise={opt.test_noiseL}): {ssim_test:.4f}")
+    total_psnr = 0.0
+    total_ssim = 0.0
+    for image_path in image_files:
+        clean = load_image(image_path)
+        psnr, ssim = evaluate_image(model, clean, args.test_noiseL)
+        total_psnr += psnr
+        total_ssim += ssim
+        print(f"{os.path.basename(image_path)} PSNR {psnr:.4f} SSIM {ssim:.4f}")
+
+    count = len(image_files)
+    print(f"\nAverage PSNR on {args.test_data} (Noise={args.test_noiseL}): {total_psnr / count:.4f}")
+    print(f"Average SSIM on {args.test_data} (Noise={args.test_noiseL}): {total_ssim / count:.4f}")
+
 
 if __name__ == "__main__":
     main()

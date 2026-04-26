@@ -1,153 +1,186 @@
-import os
+"""Train the blind grayscale denoising model."""
+
 import argparse
-import numpy as np
+import os
+
 import jittor as jt
-from jittor import nn
-from jittor import optim
+import numpy as np
+from jittor import nn, optim
 from jittor.dataset import DataLoader
-from tensorboardX import SummaryWriter #
+from tensorboardX import SummaryWriter
+
+from dataset import Dataset, prepare_data
 from models import UNet
-from dataset import prepare_data, Dataset
-from utils import *
-import jittor.transform as transform
+from utils import batch_PSNR, batch_SSIM, weights_init_kaiming
 
-# Jittor自动管理GPU，无需手动设置CUDA环境变量
-jt.flags.use_cuda = 1  # 启用GPU
 
-parser = argparse.ArgumentParser(description="DnCNN")
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ("yes", "true", "t", "y", "1"):
         return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+    if value in ("no", "false", "f", "n", "0"):
         return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
-parser.add_argument("--preprocess", type=str2bool, default=False, help='run prepare_data or not')
-parser.add_argument("--batchSize", type=int, default=128, help="Training batch size")
-parser.add_argument("--num_of_layers", type=int, default=17, help="Number of total layers")
-parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
-parser.add_argument("--milestone", type=int, default=6, help="When to decay learning rate; should be less than epochs")
-parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate")
-parser.add_argument("--outf", type=str, default="logs", help='path of log files')
-parser.add_argument("--mode", type=str, default="S", help='with known noise level (S) or blind training (B)')
-parser.add_argument("--noiseL", type=float, default=25, help='noise level; ignored when mode=B')
-parser.add_argument("--val_noiseL", type=float, default=25, help='noise level used on validation set')
-opt = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train DnCNN-style blind denoiser")
+    parser.add_argument("--preprocess", type=str2bool, default=False)
+    parser.add_argument("--batch-size", "--batchSize", dest="batch_size", type=int, default=128)
+    parser.add_argument("--num_of_layers", type=int, default=17, help="Kept for old commands.")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--milestone", type=int, default=6)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--outf", type=str, default="logs/DnCNN-B")
+    parser.add_argument("--mode", choices=("S", "B"), default="B")
+    parser.add_argument("--noiseL", type=float, default=25, help="Noise level for mode S.")
+    parser.add_argument("--val_noiseL", type=float, default=25)
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--use-cuda", type=str2bool, default=True)
+    return parser.parse_args()
+
+
+def make_noise(clean, mode, noise_level, blind_range=(0, 55)):
+    """Create Gaussian noise and the matching noise-level map."""
+
+    if mode == "S":
+        sigma = noise_level / 255.0
+        return jt.randn(clean.shape) * sigma, jt.full_like(clean, sigma)
+
+    noise = jt.zeros(clean.shape)
+    noise_map = jt.zeros(clean.shape)
+    sigmas = np.random.uniform(blind_range[0], blind_range[1], size=clean.shape[0])
+    for batch_idx, sigma in enumerate(sigmas):
+        sigma = sigma / 255.0
+        sample_shape = noise[batch_idx, :, :, :].shape
+        noise[batch_idx, :, :, :] = jt.randn(sample_shape) * sigma
+        noise_map[batch_idx, :, :, :] = sigma
+    return noise, noise_map
+
+
+def build_loaders(args):
+    train_set = Dataset(train=True)
+    val_set = Dataset(train=False)
+    train_loader = DataLoader(
+        dataset=train_set,
+        num_workers=args.num_workers,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        dataset=val_set,
+        num_workers=args.num_workers,
+        batch_size=1,
+        shuffle=False,
+        drop_last=False,
+    )
+    return train_set, val_set, train_loader, val_loader
+
+
+def train_one_epoch(model, criterion, optimizer, loader, args, epoch, step, writer, train_size):
+    num_batches = (train_size + args.batch_size - 1) // args.batch_size
+    current_lr = args.lr if epoch < args.milestone else args.lr / 10.0
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = current_lr
+    print(f"learning rate {current_lr:.6f}")
+
+    model.train()
+    for batch_idx, clean in enumerate(loader, start=1):
+        optimizer.zero_grad()
+        noise, noise_map = make_noise(clean, args.mode, args.noiseL)
+        noisy = clean + noise
+        model_input = jt.concat([noisy, noise_map], dim=1)
+
+        predicted_noise = model(model_input)
+        loss = criterion(predicted_noise, noise) / (noisy.shape[0] * 2)
+        optimizer.step(loss)
+
+        restored = jt.clamp(noisy - predicted_noise, 0.0, 1.0)
+        psnr = batch_PSNR(restored, clean, 1.0)
+        ssim = batch_SSIM(restored, clean, 1.0)
+        print(
+            "[epoch %d][%d/%d] loss: %.4f PSNR_train: %.4f SSIM_train: %.4f"
+            % (epoch + 1, batch_idx, num_batches, loss.item(), psnr, ssim)
+        )
+
+        if step % 10 == 0:
+            writer.add_scalar("loss", loss.item(), step)
+            writer.add_scalar("PSNR/train", psnr, step)
+            writer.add_scalar("SSIM/train", ssim, step)
+        step += 1
+    return step
+
+
+def validate(model, loader, args, val_size):
+    model.eval()
+    total_psnr = 0.0
+    total_ssim = 0.0
+
+    with jt.no_grad():
+        for clean in loader:
+            sigma = args.val_noiseL / 255.0
+            noise = jt.randn(clean.shape) * sigma
+            noisy = clean + noise
+            noise_map = jt.full_like(clean, sigma)
+            model_input = jt.concat([noisy, noise_map], dim=1)
+
+            predicted_noise = model(model_input)
+            restored = jt.clamp(noisy - predicted_noise, 0.0, 1.0)
+            total_psnr += batch_PSNR(restored, clean, 1.0)
+            total_ssim += batch_SSIM(restored, clean, 1.0)
+
+    return total_psnr / val_size, total_ssim / val_size
+
 
 def main():
-    # Load dataset
-    print('Loading dataset ...\n')
-    dataset_train = Dataset(train=True)
-    dataset_val = Dataset(train=False)
-    # drop_last=False 确保处理所有数据，即使最后一个批次不完整。
-    loader_train = DataLoader(dataset=dataset_train, num_workers=4, batch_size=opt.batchSize, shuffle=True, drop_last=False)
-    # 验证集图像大小不同，批大小必须为1
-    loader_val = DataLoader(dataset=dataset_val, num_workers=4, batch_size=1, shuffle=False, drop_last=False)
-    # 使用向上取整除法，以在 drop_last=False 时获得正确的批次数。
-    num_batches_train = (len(dataset_train) + opt.batchSize - 1) // opt.batchSize
-    # 当批大小为1时，批次数等于样本数
-    num_batches_val = len(dataset_val)
+    args = parse_args()
+    jt.flags.use_cuda = 1 if args.use_cuda else 0
+    os.makedirs(args.outf, exist_ok=True)
 
-    print("# of training samples: %d\n" % int(len(dataset_train)))
-    # Build model
-    net = UNet(channels=1)
-    net.apply(weights_init_kaiming)
-    criterion = nn.MSELoss()  # Jittor默认为sum reduction
-    # Jittor自动管理GPU，无需手动移动模型
-    model = net
-    # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=opt.lr)
-    # training
-    writer = SummaryWriter(opt.outf)
+    if args.preprocess:
+        aug_times = 1 if args.mode == "S" else 2
+        prepare_data(
+            data_path=args.data_dir,
+            patch_size=64,
+            stride=10,
+            aug_times=aug_times,
+        )
+
+    print("Loading dataset ...")
+    train_set, val_set, train_loader, val_loader = build_loaders(args)
+    print(f"# of training samples: {len(train_set)}")
+
+    model = UNet(channels=1)
+    model.apply(weights_init_kaiming)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    writer = SummaryWriter(args.outf)
+
     step = 0
-    noiseL_B=[0,55] # ingnored when opt.mode=='S'
-    for epoch in range(opt.epochs):
-        if epoch < opt.milestone:
-            current_lr = opt.lr
-        else:
-            current_lr = opt.lr / 10.
-        # set learning rate
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = current_lr
-        print('learning rate %f' % current_lr)
-        # train
-        for i, data in enumerate(loader_train, 0):
-            # training step
-            model.train()
-            optimizer.zero_grad()
-            img_train = data
-            
-            # 生成噪声和对应的噪声水平图
-            noise_map = jt.zeros(img_train.shape)
-            if opt.mode == 'S':
-                noise = jt.randn(img_train.shape) * (opt.noiseL/255.)
-                noise_map = jt.full_like(img_train, opt.noiseL/255.)
-            if opt.mode == 'B':
-                noise = jt.zeros(img_train.shape)
-                stdN = np.random.uniform(noiseL_B[0], noiseL_B[1], size=noise.shape[0])
-                for n in range(noise.shape[0]):
-                    sizeN = noise[0,:,:,:].shape
-                    noise_std = stdN[n]/255.
-                    noise[n,:,:,:] = jt.randn(sizeN) * noise_std
-                    noise_map[n,:,:,:] = noise_std
+    for epoch in range(args.epochs):
+        step = train_one_epoch(
+            model,
+            criterion,
+            optimizer,
+            train_loader,
+            args,
+            epoch,
+            step,
+            writer,
+            len(train_set),
+        )
+        psnr, ssim = validate(model, val_loader, args, len(val_set))
+        print(f"\n[epoch {epoch + 1}] PSNR_val: {psnr:.4f} SSIM_val: {ssim:.4f}")
+        writer.add_scalar("PSNR/val", psnr, epoch)
+        writer.add_scalar("SSIM/val", ssim, epoch)
+        jt.save(model.state_dict(), os.path.join(args.outf, "net.pkl"))
 
-            imgn_train = img_train + noise
-            model_input = jt.concat([imgn_train, noise_map], dim=1)
+    writer.close()
 
-            # Jittor自动管理GPU，无需手动移动张量
-            predicted_noise = model(model_input)
-            loss = criterion(predicted_noise, noise) / (imgn_train.shape[0]*2)
-            optimizer.step(loss)
-            
-            # results - 使用同一次前向传播的结果计算指标，避免重复计算
-            out_train = jt.clamp(imgn_train - predicted_noise, 0., 1.)
-            psnr_train = batch_PSNR(out_train, img_train, 1.)
-            ssim_train = batch_SSIM(out_train, img_train, 1.)
-            print("[epoch %d][%d/%d] loss: %.4f PSNR_train: %.4f SSIM_train: %.4f" %
-                (epoch+1, i+1, num_batches_train, loss.item(), psnr_train, ssim_train))
-            # if you are using older version of PyTorch, you may need to change loss.item() to loss.data[0]
-            if step % 10 == 0:
-                # Log the scalar values
-                writer.add_scalar('loss', loss.item(), step)
-                writer.add_scalar('PSNR on training data', psnr_train, step)
-                writer.add_scalar('SSIM on training data', ssim_train, step)
-            step += 1
-        ## the end of each epoch
-        model.eval()
-        # validate
-        psnr_val = 0
-        ssim_val = 0
-        # 使用 DataLoader 和 no_grad() 进行高效验证
-        with jt.no_grad():
-            for i, img_val in enumerate(loader_val):
-                noise = jt.randn(img_val.shape) * (opt.val_noiseL/255.)
-                imgn_val = img_val + noise
-                # 为验证集创建噪声图和模型输入
-                noise_map_val = jt.full_like(img_val, opt.val_noiseL/255.)
-                model_input_val = jt.concat([imgn_val, noise_map_val], dim=1)
-
-                # Jittor自动管理GPU
-                predicted_noise_val = model(model_input_val)
-                out_val = jt.clamp(imgn_val - predicted_noise_val, 0., 1.)
-                psnr_val += batch_PSNR(out_val, img_val, 1.)
-                ssim_val += batch_SSIM(out_val, img_val, 1.)
-        psnr_val /= num_batches_val
-        ssim_val /= num_batches_val
-        print("\n[epoch %d] PSNR_val: %.4f SSIM_val: %.4f" % (epoch+1, psnr_val, ssim_val))
-
-        writer.add_scalar('PSNR on validation data', psnr_val, epoch)
-        writer.add_scalar('SSIM on validation data', ssim_val, epoch)
-        # save model
-        jt.save(model.state_dict(), os.path.join(opt.outf, 'net.pkl'))
 
 if __name__ == "__main__":
-    if opt.preprocess:
-        if opt.mode == 'S':
-            prepare_data(data_path='data', patch_size=64, stride=10, aug_times=1) # 增加到64，适配3层下采样
-        if opt.mode == 'B':
-            prepare_data(data_path='data', patch_size=64, stride=10, aug_times=2) # 增加到64，适配3层下采样
     main()

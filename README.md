@@ -1,170 +1,126 @@
-# DnCNN-PyTorch NeiKos496小组作业
+# DnCNN / U-Net Image Denoising with Jittor
 
-这是 TIP2017 论文 Beyond a Gaussian Denoiser: Residual Learning of Deep CNN for Image Denoising 的 PyTorch 实现(http://ieeexplore.ieee.org/document/7839189/)。
+> 课程作业项目：将经典 DnCNN 图像去噪实验迁移到 Jittor，并在盲去噪设置下引入噪声水平图与轻量 U-Net 结构进行实验。
 
-作者的 MATLAB 实现请见此处(https://github.com/cszn/DnCNN).
+## Highlights
 
-原代码是使用 PyTorch < 0.4 编写的，本次作业对低版本语法进行了优化，现已迁移至 Jittor 框架
+- **任务**：灰度图像加性高斯噪声去除，覆盖固定噪声与盲去噪两种模式。
+- **框架**：Jittor，保留 PyTorch 版 DnCNN 的残差学习思想。
+- **模型**：输入为 `noisy image + noise level map`，网络预测噪声残差，输出通过 `clean = noisy - predicted_noise` 得到。
+- **评估**：在 Set12、Set68 上统计 PSNR / SSIM。
 
-如何运行
+## Repository Layout
 
-1. 依赖项 
+```text
+.
+├── data/              # 训练图像与 Set12 / Set68 测试集
+├── logs/DnCNN-B/      # 训练输出目录，默认保存 net.pkl
+├── dataset.py         # HDF5 数据预处理与 Jittor Dataset
+├── models.py          # U-Net 去噪网络
+├── train.py           # 训练入口
+├── test.py            # 测试入口
+├── utils.py           # 初始化、指标、数据增强工具
+└── README.md
+```
 
-**基础环境：**
-- Python 3.9+
-- CUDA（用于GPU加速，Jittor会自动管理）
+## Environment
 
-**核心依赖：**
-- Jittor（深度学习框架）
-- NumPy（数组操作）
-- OpenCV (cv2)（图像处理）
-- h5py（HDF5数据文件读写）
-- tensorboardX（训练可视化）
+建议使用 Python 3.9+。如果本机有 CUDA，Jittor 会自动编译并调用 GPU 后端。
 
-**评估指标库：**
-- scikit-image (skimage)（PSNR和SSIM计算）
-
-**安装命令：**
 ```bash
-# 安装 Jittor（根据CUDA版本选择）
+python -m pip install -r requirements.txt
+```
+
+如果需要手动安装 Jittor：
+
+```bash
 python -m pip install jittor
-# 或指定CUDA版本，例如：
-# python -m pip install jittor-cuda
-
-# 安装其他依赖
-pip install numpy opencv-python h5py tensorboardX scikit-image
 ```
 
-2.训练 DnCNN-B (盲去噪的 DnCNN)/已改动
+## Quick Start
 
-conda activate myenv
-cd /home/xie/zzzmypython/DnCNNunet
+首次训练前需要把 `data/train` 和 `data/Set12` 预处理成 `train.h5`、`val.h5`：
 
 ```bash
-nohup python train.py --preprocess True --num_of_layers 20 --mode B --val_noiseL 25 --outf logs/DnCNN-B  > logs/DnCNN-B.log 2>&1 &
+python train.py --preprocess True --mode B --epochs 10 --outf logs/DnCNN-B
 ```
 
-测试set68
+已经生成 HDF5 后，可以跳过预处理直接训练：
 
 ```bash
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set68" --test_noiseL 15
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set68" --test_noiseL 25
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set68" --test_noiseL 50
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set68" --test_noiseL 75
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set68" --test_noiseL 100
+python train.py --mode B --batch-size 128 --epochs 10 --val_noiseL 25 --outf logs/DnCNN-B
 ```
 
-### BSD68 平均 PSNR
+后台训练示例：
 
-| Noise Level | DnCNN-S | DnCNN-B |
-|:-----------:|:-------:|:-------:|
-|     15      |  31.73  |  31.61  |
-|     25      |  29.23  |  29.16  | 
-|     50      |  26.23  |  26.23  | 
-
-
-| Noise Level | DnCNN-S-PyTorch | DnCNN-B-PyTorch | DnCNN-S-ours    | DnCNN-B-ours    |
-|:-----------:|:---------------:|:---------------:|:---------------:|:---------------:|
-|     15      |      31.71      |      31.60      |      31.70      |     31.62       |
-|     25      |      29.21      |      29.15      |      29.17      |     29.16       |
-|     50      |      26.22      |      26.20      |      26.16      |     26.20       |
-
-
-### BSD68 本次作业修改后的得分（1为参考FFDNet且使用U-net框架）
-
-| Noise Level | DnCNN-B         | DnCNN-B-1       | DnCNN-B-jittor  |
-|:-----------:|:---------------:|:---------------:|:---------------:|
-|     50      |      26.20      |       26.11     |        26.11    |
-|     75      |      17.89      |       24.35     |        24.47    |
-|    100      |      13.65      |       22.91     |        22.95    |
-
-### BSD68 平均 SSIM
-
-| Noise Level | DnCNN-S-PyTorch | DnCNN-B-PyTorch | DnCNN-S-ours    | DnCNN-B-ours    |
-|:-----------:|:---------------:|:---------------:|:---------------:|:---------------:|
-|     15      |      0.895      |      0.891      |      0.895      |      0.891      |
-|     25      |      0.833      |      0.827      |      0.832      |      0.829      |
-|     50      |      0.719      |      0.714      |      0.719      |      0.715      |
-
-
-| Noise Level | DnCNN-B         | DnCNN-B-1       | DnCNN-B-jittor  |
-|:-----------:|:---------------:|:---------------:|:---------------:|
-|     50      |      0.715      |       0.713     |       0.708     |
-|     75      |      0.294      |       0.614     |       0.621     |
-|    100      |      0.160      |       0.503     |       0.508     |
-  
-
-
-测试set12
-
-```bah
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set12" --test_noiseL 15
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set12" --test_noiseL 25
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set12" --test_noiseL 50
-
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set12" --test_noiseL 75
-python test.py --num_of_layers 20 --logdir logs/DnCNN-B --test_data "Set12" --test_noiseL 100
+```bash
+nohup python train.py --preprocess True --mode B --val_noiseL 25 --outf logs/DnCNN-B > logs/DnCNN-B.log 2>&1 &
 ```
 
-### Set12 平均 PSNR
+## Evaluation
 
-| Noise Level | DnCNN-S | DnCNN-B | 
-|:-----------:|:-------:|:-------:|
-|     15      | 32.859  | 32.680  |   
-|     25      | 30.436  | 30.362  |  
-|     50      | 27.178  | 27.206  | 
+Set68:
 
+```bash
+python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 15
+python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 25
+python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 50
+python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 75
+python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 100
+```
 
+Set12:
 
-| Noise Level | DnCNN-S-PyTorch | DnCNN-B-PyTorch | DnCNN-S-ours    | DnCNN-B-ours    |
-|:-----------:|:---------------:|:---------------:|:---------------:|:---------------:|
-|     15      |     32.837      |     32.725      |     32.811      |     32.731      |
-|     25      |     30.404      |     30.344      |     30.349      |     30.376      |
-|     50      |     27.165      |     27.138      |     27.057      |     27.132      |
+```bash
+python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 15
+python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 25
+python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 50
+python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 75
+python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 100
+```
 
-### Set12 本次作业修改后的得分（1为参考FFDNet且使用U-net框架）
+## Results
 
-| Noise Level | DnCNN-B         | DnCNN-B-1       |
-|:-----------:|:---------------:|:---------------:|
-|     50      |      27.132     |       26.846    |            
-|     75      |      18.113     |       24.749    |            
-|    100      |      13.895     |       22.996    |            
+### Set68 / BSD68
 
+| Noise Level | Baseline DnCNN-B PSNR | Ours PSNR | Baseline DnCNN-B SSIM | Ours SSIM |
+|:-----------:|:---------------------:|:---------:|:---------------------:|:---------:|
+| 15 | 31.60 | 31.62 | 0.891 | 0.891 |
+| 25 | 29.15 | 29.16 | 0.827 | 0.829 |
+| 50 | 26.20 | 26.20 | 0.714 | 0.715 |
 
-### Set12 平均 SSIM
+高噪声盲去噪补充实验：
 
-| Noise Level | DnCNN-S-PyTorch | DnCNN-B-PyTorch | DnCNN-S-ours    | DnCNN-B-ours    |
-|:-----------:|:---------------:|:---------------:|:---------------:|:---------------:|
-|     15      |     0.904       |     0.902       |     0.904       |     0.903       |
-|     25      |     0.862       |     0.859       |     0.861       |     0.862       |
-|     50      |     0.779       |     0.773       |     0.779       |     0.777       |
+| Noise Level | DnCNN-B PSNR | Ours PSNR | DnCNN-B SSIM | Ours SSIM |
+|:-----------:|:------------:|:---------:|:------------:|:---------:|
+| 50 | 26.20 | 26.11 | 0.715 | 0.708 |
+| 75 | 17.89 | 24.47 | 0.294 | 0.621 |
+| 100 | 13.65 | 22.95 | 0.160 | 0.508 |
 
+### Set12
 
+| Noise Level | Baseline DnCNN-B PSNR | Ours PSNR | Baseline DnCNN-B SSIM | Ours SSIM |
+|:-----------:|:---------------------:|:---------:|:---------------------:|:---------:|
+| 15 | 32.725 | 32.731 | 0.902 | 0.903 |
+| 25 | 30.344 | 30.376 | 0.859 | 0.862 |
+| 50 | 27.138 | 27.132 | 0.773 | 0.777 |
 
-| Noise Level | DnCNN-B         | DnCNN-B-1       |
-|:-----------:|:---------------:|:---------------:|
-|     50      |      0.777      |      0.765      |            
-|     75      |      0.290      |      0.668      |            
-|    100      |      0.163      |      0.549      |            
+高噪声盲去噪补充实验：
 
+| Noise Level | DnCNN-B PSNR | Ours PSNR | DnCNN-B SSIM | Ours SSIM |
+|:-----------:|:------------:|:---------:|:------------:|:---------:|
+| 50 | 27.132 | 26.846 | 0.777 | 0.765 |
+| 75 | 18.113 | 24.749 | 0.290 | 0.668 |
+| 100 | 13.895 | 22.996 | 0.163 | 0.549 |
 
+## Notes
 
-# 失败改动展示
+- `--mode S` 表示固定噪声水平训练，`--mode B` 表示盲去噪训练。
+- `--num_of_layers` 仅为兼容早期 DnCNN 命令保留；当前模型结构定义在 `models.py` 的 `UNet` 中。
+- 测试脚本会自动把输入图像 padding 到 8 的倍数，以匹配 3 层下采样结构，再裁剪回原尺寸计算指标。
+- 曾尝试加入注意力模块与对抗训练。注意力模块在当前 AWGN 设置下收益有限；对抗训练增加了训练成本且未带来稳定提升，因此最终版本保留更稳定的噪声水平图 + U-Net 方案。
 
-### BSD68 平均 RSNR(注意力机制添加前后对比)
+## Reference
 
-| Noise Level | DnCNN-B  |DnCNN-B-se|
-|:-----------:|:--------:|:--------:|
-|     15      |  31.62   |  31.68   |  
-|     25      |  29.16   |  29.19   |
-|     50      |  26.20   |  26.20   |
-
-### Set12 平均 PSNR
-
-| Noise Level | DnCNN-B   |DnCNN-B-se |
-|:-----------:|:---------:|:---------:|
-|     15      |  32.731   |  32.757   | 
-|     25      |  30.376   |  30.430   |
-|     50      |  27.132   |  27.184   |
-
-由于添加生成对抗网络后训练数据未及时保存，且复现失败案例耗时且无意义故没有展示
+- Zhang et al., [Beyond a Gaussian Denoiser: Residual Learning of Deep CNN for Image Denoising](https://ieeexplore.ieee.org/document/7839189/)
+- Original MATLAB implementation: [cszn/DnCNN](https://github.com/cszn/DnCNN)
