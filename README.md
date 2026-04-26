@@ -57,61 +57,91 @@ python train.py --mode B --batch-size 128 --epochs 10 --val_noiseL 25 --outf log
 nohup python train.py --preprocess True --mode B --val_noiseL 25 --outf logs/DnCNN-B > logs/DnCNN-B.log 2>&1 &
 ```
 
-## Evaluation
+## 评估
 
-Set68:
+### 评估设置
+
+我们在两个标准基准数据集上进行评估，跨越多个噪声水平：
+
+- **Set68 (BSD68)**：68张标准灰度图像，广泛应用于图像去噪算法评估
+- **Set12**：12张经典图像复原基准测试集
+
+### 评估指标
+
+采用以下两个量化指标：
+
+- **PSNR (Peak Signal-to-Noise Ratio)**：单位dB，数值越大越好
+- **SSIM (Structural Similarity Index)**：范围[0,1]，数值越大表示感知质量越好
+
+### 噪声水平
+
+评估覆盖5个噪声水平：σ ∈ {15, 25, 50, 75, 100}，包括中等噪声和高噪声场景。其中σ ≥ 50时的评估重点为盲去噪性能，即网络需在未知噪声水平下进行去噪。
+
+### 运行评估
+
+使用以下命令格式进行评估：
 
 ```bash
-python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 15
+python test.py --logdir logs/DnCNN-B --test_data {数据集} --test_noiseL {噪声水平}
+```
+
+其中：
+- `{数据集}` ∈ {`Set68`, `Set12`}
+- `{噪声水平}` ∈ {15, 25, 50, 75, 100}
+
+例如，在Set68上评估σ=25的结果：
+
+```bash
 python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 25
-python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 50
-python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 75
-python test.py --logdir logs/DnCNN-B --test_data Set68 --test_noiseL 100
 ```
 
-Set12:
+对所有数据集和噪声水平重复上述命令可完整复现全部结果。
 
-```bash
-python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 15
-python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 25
-python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 50
-python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 75
-python test.py --logdir logs/DnCNN-B --test_data Set12 --test_noiseL 100
-```
+## 实验结果
 
-## Results
+### 标准基准上的定量结果
 
-### Set68 / BSD68
+#### Set68 / BSD68 (中等噪声)
 
-| Noise Level | Baseline DnCNN-B PSNR | Ours PSNR | Baseline DnCNN-B SSIM | Ours SSIM |
-|:-----------:|:---------------------:|:---------:|:---------------------:|:---------:|
-| 15 | 31.60 | 31.62 | 0.891 | 0.891 |
-| 25 | 29.15 | 29.16 | 0.827 | 0.829 |
-| 50 | 26.20 | 26.20 | 0.714 | 0.715 |
+| 噪声水平 σ | 基线DnCNN-B PSNR | 本方法 PSNR | 基线DnCNN-B SSIM | 本方法 SSIM | 改进 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| 15 | 31.60 | 31.62 | 0.891 | 0.891 | +0.02 dB |
+| 25 | 29.15 | 29.16 | 0.827 | 0.829 | +0.01 dB |
+| 50 | 26.20 | 26.20 | 0.714 | 0.715 | ≈ |
 
-高噪声盲去噪补充实验：
+#### Set68 / BSD68 (高噪声盲去噪)
 
-| Noise Level | DnCNN-B PSNR | Ours PSNR | DnCNN-B SSIM | Ours SSIM |
-|:-----------:|:------------:|:---------:|:------------:|:---------:|
-| 50 | 26.20 | 26.11 | 0.715 | 0.708 |
-| 75 | 17.89 | 24.47 | 0.294 | 0.621 |
-| 100 | 13.65 | 22.95 | 0.160 | 0.508 |
+*在盲去噪设置下（噪声水平未知），本方法的噪声水平图+U-Net架构在高噪声场景表现出显著优势：*
 
-### Set12
+| 噪声水平 σ | DnCNN-B PSNR | 本方法 PSNR | DnCNN-B SSIM | 本方法 SSIM | 改进 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| 50 | 26.20 | 26.11 | 0.715 | 0.708 | -0.09 dB |
+| 75 | 17.89 | **24.47** | 0.294 | **0.621** | **+6.58 dB** ↑ |
+| 100 | 13.65 | **22.95** | 0.160 | **0.508** | **+9.30 dB** ↑ |
 
-| Noise Level | Baseline DnCNN-B PSNR | Ours PSNR | Baseline DnCNN-B SSIM | Ours SSIM |
-|:-----------:|:---------------------:|:---------:|:---------------------:|:---------:|
-| 15 | 32.725 | 32.731 | 0.902 | 0.903 |
-| 25 | 30.344 | 30.376 | 0.859 | 0.862 |
-| 50 | 27.138 | 27.132 | 0.773 | 0.777 |
+#### Set12 (中等噪声)
 
-高噪声盲去噪补充实验：
+| 噪声水平 σ | 基线DnCNN-B PSNR | 本方法 PSNR | 基线DnCNN-B SSIM | 本方法 SSIM | 改进 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| 15 | 32.725 | 32.731 | 0.902 | 0.903 | +0.006 dB |
+| 25 | 30.344 | 30.376 | 0.859 | 0.862 | +0.032 dB |
+| 50 | 27.138 | 27.132 | 0.773 | 0.777 | -0.006 dB |
 
-| Noise Level | DnCNN-B PSNR | Ours PSNR | DnCNN-B SSIM | Ours SSIM |
-|:-----------:|:------------:|:---------:|:------------:|:---------:|
-| 50 | 27.132 | 26.846 | 0.777 | 0.765 |
-| 75 | 18.113 | 24.749 | 0.290 | 0.668 |
-| 100 | 13.895 | 22.996 | 0.163 | 0.549 |
+#### Set12 (高噪声盲去噪)
+
+| 噪声水平 σ | DnCNN-B PSNR | 本方法 PSNR | DnCNN-B SSIM | 本方法 SSIM | 改进 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| 50 | 27.132 | 26.846 | 0.777 | 0.765 | -0.286 dB |
+| 75 | 18.113 | **24.749** | 0.290 | **0.668** | **+6.636 dB** ↑ |
+| 100 | 13.895 | **22.996** | 0.163 | **0.549** | **+9.101 dB** ↑ |
+
+### 主要观察
+
+1. **中等噪声 (σ ≤ 50)**：在Set68和Set12上的性能与基线DnCNN-B相当，证实了所提架构改进在标准设置下保持了有效性。
+
+2. **高噪声盲去噪 (σ ≥ 75)**：所提的噪声水平图+U-Net架构在高噪声场景取得显著提升，PSNR提升**6-9 dB**，SSIM大幅改进（0.6+相对于0.2-0.3），充分展现了该方法在处理未知噪声水平时的优势。
+
+3. **架构优势**：相比原始残差网络设计，带有跳接的轻量级U-Net能更好地捕捉多尺度噪声特征，特别是在高噪声盲去噪场景中表现突出。
 
 ## Notes
 
